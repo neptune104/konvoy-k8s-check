@@ -1,0 +1,188 @@
+---
+
+    # TODO this assumes the provided endpoint in inventory.yaml is an IP
+  - name: calico health
+    command: kubectl --kubeconfig /etc/kubernetes/admin.conf get pods -n kube-system --field-selector status.podIP={{inventory_hostname}} -l 'k8s-app in (calico-node, calico-route-reflector)' -o jsonpath='{.items[0].status.phase}'
+    register: status
+    until: status is success and "Running" in status.stdout
+    retries: 24
+    delay: 10
+    delegate_to: "{{ groups['control-plane'][0] }}"
+    changed_when: False
+
+  - debug: var=status
+
+    # coredns replicas is hardcoded by kubeadm to 2
+  - name: coredns health
+    command: kubectl --kubeconfig /etc/kubernetes/admin.conf get deploy coredns -n kube-system -o jsonpath='{.status.availableReplicas}'
+    register: status
+    until: status is success and "2" in status.stdout
+    retries: 6
+    delay: 10
+    delegate_to: "{{ groups['control-plane'][0] }}"
+    run_once: yes
+    changed_when: False
+
+  - debug: var=status
+
+  - name: count number of nodes
+    command: kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes -o wide
+    register: nodes
+    delegate_to: "{{ groups['control-plane'][0] }}"
+    run_once: yes
+    failed_when: nodes is failure or nodes.stdout_lines | length != (groups['node'] | union(groups['control-plane']) | unique | length + 1)
+    changed_when: False
+
+  - debug: var=nodes
+
+    # TODO it would be good to know which node is not but its difficult to try to figure out node names based on the inventory
+  - name: check nodes are Ready
+    command: kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes -o wide
+    register: nodes
+    delegate_to: "{{ groups['control-plane'][0] }}"
+    run_once: yes
+    until: nodes is succeeded
+    retries: 6
+    delay: 10
+    failed_when: nodes is failure or "NotReady" in nodes.stdout
+    changed_when: False
+
+  # Check the version of components and pods is the one specified in the cluster.yaml
+  - name: verify Kubernetes version
+    block:
+      - name: check control plane node is running the expected Kubernetes version
+        command: >
+          kubectl get nodes
+            --kubeconfig=/etc/kubernetes/admin.conf
+            -o=jsonpath=$'{range .items[*]}{@.status.nodeInfo.kubeletVersion}{end}'
+            --selector=konvoy.mesosphere.com/inventory_hostname={{ inventory_hostname}}
+        register: node_version
+        when: "'control-plane' in group_names"
+        until: node_version.rc == 0
+        retries: 3
+        delay: 10
+        failed_when:
+          - package_versions.kubenode not in node_version.stdout
+        changed_when: False
+
+      - name: check control plane scheduler pods version
+        shell: |
+          set -o pipefail && \
+          kubectl get pods \
+           -n kube-system \
+           -l component=kube-scheduler \
+           -o jsonpath="{.items[*].spec.containers[*].image}" \
+           --kubeconfig=/etc/kubernetes/admin.conf \
+           | grep -io "kube-scheduler:v{{ kubeadm.formatted_version }}" \
+           | wc -l
+        args:
+          executable: /bin/bash
+        register: scheduler_pods_version_counter
+        when: "'control-plane' in group_names"
+        until: scheduler_pods_version_counter.rc == 0
+        retries: 3
+        delay: 10
+        failed_when:
+          - scheduler_pods_version_counter.stdout != control_plane_nodes
+        changed_when: False
+
+      - name: check control plane apiserver pods version
+        shell: |
+          set -o pipefail && \
+          kubectl get pods \
+           -n kube-system \
+           -l component=kube-apiserver \
+           -o jsonpath="{.items[*].spec.containers[*].image}" \
+           --kubeconfig=/etc/kubernetes/admin.conf \
+           | grep -io "kube-apiserver:v{{ kubeadm.formatted_version }}" \
+           | wc -l
+        args:
+          executable: /bin/bash
+        register: apiserver_pods_version_counter
+        when: "'control-plane' in group_names"
+        until: apiserver_pods_version_counter.rc == 0
+        retries: 3
+        delay: 10
+        failed_when:
+          - apiserver_pods_version_counter.stdout != control_plane_nodes
+        changed_when: False
+
+      - name: check control plane controller-manager pods version
+        shell: |
+          set -o pipefail && \
+          kubectl get pods \
+            -n kube-system \
+            -l component=kube-controller-manager \
+            -o jsonpath="{.items[*].spec.containers[*].image}" \
+            --kubeconfig=/etc/kubernetes/admin.conf \
+            | grep -io "kube-controller-manager:v{{ kubeadm.formatted_version }}" \
+            | wc -l
+        args:
+          executable: /bin/bash
+        register: controller_pods_version_counter
+        when: "'control-plane' in group_names"
+        until: controller_pods_version_counter.rc == 0
+        retries: 3
+        delay: 10
+        failed_when:
+          - controller_pods_version_counter.stdout != control_plane_nodes
+        changed_when: False
+
+      - name: check worker node is running the expected Kubernetes version
+        command: >
+          kubectl get nodes
+            --kubeconfig=/etc/kubernetes/kubelet.conf
+            -o=jsonpath=$'{range .items[*]}{@.status.nodeInfo.kubeletVersion}{end}'
+            --selector=konvoy.mesosphere.com/inventory_hostname={{ inventory_hostname}}
+        register: worker_node_version
+        when: "'node' in group_names"
+        until: worker_node_version.rc == 0
+        retries: 3
+        delay: 10
+        changed_when: False
+
+      - name: warn if worker node is not running the expected Kubernetes version
+        ignore_errors: True
+        when:
+          - "'node' in group_names"
+          - package_versions.kubenode not in worker_node_version.stdout
+        fail:
+          msg: "WARNING: Worker node is running Kubernetes version {{ worker_node_version.stdout | replace('$v','') }}, but should be running {{ package_versions.kubenode }}."
+
+      - name: check worker node is running at least the minimum (inclusive) Kubernetes version
+        vars:
+          worker_node_version_sanitized: "{{ worker_node_version.stdout | replace('$v','') }}"
+        when:
+          - "'node' in group_names"
+        assert:
+          that:
+            - worker_node_version_sanitized is version(minimum_inclusive_kubernetes_version, operator='>=', strict=True)
+          msg: "The node Kubernetes version is {{ worker_node_version_sanitized }}. It should be equal to or greater than {{ minimum_inclusive_kubernetes_version }}."
+        changed_when: False
+
+      - name: check worker node is running less than the maximum (exclusive) Kubernetes version
+        vars:
+          worker_node_version_sanitized: "{{ worker_node_version.stdout | replace('$v','') }}"
+        when:
+          - "'node' in group_names"
+        assert:
+          that:
+            - worker_node_version_sanitized is version(maximum_exclusive_kubernetes_version, operator='<', strict=True)
+          msg: "The node Kubernetes version is {{ worker_node_version_sanitized }}. It should be less than {{ maximum_exclusive_kubernetes_version }}."
+        changed_when: False
+
+      - name: check kubectl returned server version
+        shell: set -o pipefail && kubectl version --kubeconfig=/etc/kubernetes/admin.conf --short | grep -i server
+        args:
+          executable: /bin/bash
+        register: server_version
+        when: "'control-plane' in group_names"
+        until: server_version.rc == 0
+        retries: 3
+        delay: 10
+        failed_when:
+          - package_versions.kubenode not in server_version.stdout
+        changed_when: False
+
+    vars:
+      control_plane_nodes: "{{ groups['control-plane'] | length }}"

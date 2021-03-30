@@ -1,0 +1,228 @@
+#===============================================================================
+# optional bastion host details to proxy SSH connections
+ansible_ssh_common_args: |
+  {% set ssh_args = [] %}
+  {% if groups['bastion'] is defined and groups['bastion'] | length > 0 %}
+    {% set proxy_ssh_args = [] %}
+    {% set port = hostvars[groups['bastion'][0]]['ansible_port']|default(22)|string %}
+    {% set user = hostvars[groups['bastion'][0]]['ansible_user'] %}
+    {% set host = hostvars[groups['bastion']|random]['ansible_host'] | default(hostvars[groups['bastion']|random]['inventory_hostname']) %}
+    {% set dummy = proxy_ssh_args.append('-o StrictHostKeyChecking=no') %}
+    {% set dummy = proxy_ssh_args.append('-W %h:%p') %}
+    {% set dummy = proxy_ssh_args.append('-p ' + port) %}
+    {% set dummy = proxy_ssh_args.append(user + '@' + host) %}
+    {% if ansible_ssh_private_key_file is defined and ansible_ssh_private_key_file != '' %}
+      {% set dummy = proxy_ssh_args.append('-o IdentitiesOnly=yes') %}
+      {% set dummy = proxy_ssh_args.append('-i ' + ansible_ssh_private_key_file) %}
+    {% endif %}
+    {% set dummy = ssh_args.append('-o ProxyCommand=\"ssh ' + (proxy_ssh_args|join(' ')) + '\"') %}
+  {% else %}
+    {% if ansible_ssh_private_key_file is defined and ansible_ssh_private_key_file != '' %}
+      {% set dummy = ssh_args.append('-o IdentitiesOnly=yes') %}
+    {% endif %}
+  {% endif %}
+  {{ ssh_args | join(' ') + ((' ' + ssh_common_args) if ssh_common_args is defined else '') }}
+
+
+#===============================================================================
+# metadata
+
+# With https://github.com/kubernetes/kubernetes/pull/85817 starting in Kubernetes v1.18
+# kubeadm started setting --cluster-name in the kube-controller-manager from its configuration, instead of the default 'kubernetes'
+# In GCP the cloud-controller uses this value when creating routes
+# Leading to an error like:
+# Could not create route 8aad8eb6-ef55-4124-bf3f-2b4d78537d88 192.168.4.0/24 for node d033658167-23a3-worker-4 after 211.63556ms: googleapi: Error 400: Invalid value for field 'resource.name': '033658167-8aad8eb6-ef55-4124-bf3f-2b4d78537d88'. Must be a match of regex '(?:[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?)', invalid
+# As its already done in Terraform, prepend a 'd' when the clusterName(metadata.name) starts with a digit
+# and that we replace all '[^a-z\\d-]' with a '-'
+cluster_name: >-
+  {%- if spec.kubernetes.cloudProvider.provider == 'gcp' -%}
+  {{ metadata.name | regex_replace('^([\d])', 'd\1') | regex_replace('[^a-z\d-]', '-') }}
+  {%- else -%}
+  {{ metadata.name }}
+  {%- endif -%}
+
+#===============================================================================
+# versions
+kubernetes_regexed_version: "{{ spec.kubernetes.version | regex_replace('\\+d2iq\\.[\\d]+$', '') }}"
+# https://github.com/kubernetes/release/pull/1375
+# these versions had patch versions that should be used instead
+kubernetes_rpm_patch: "{{ '1' if kubernetes_regexed_version in ['1.18.4','1.17.7','1.16.11'] else '0' }}"
+kubernetes_deb_patch: "{{ '01' if kubernetes_regexed_version in ['1.18.4','1.17.7','1.16.11'] else '00' }}"
+package_versions:
+  enable_repository_installation: "{{ (spec.osPackages.enableAdditionalRepositories if spec.osPackages is defined else true)|default(true)|bool }}"
+  # the version may contain d2iq specific suffix, remove it when downloading packages
+  kubernetes_rpm: "{{ kubernetes_regexed_version }}-{{ kubernetes_rpm_patch }}"
+  kubernetes_deb: "{{ kubernetes_regexed_version }}-{{ kubernetes_deb_patch }}"
+  kubenode: "{{ kubernetes_regexed_version }}"
+  containerd_rpm: "{{ spec.containerRuntime.containerd.version }}"
+  containerd_deb: "{{ spec.containerRuntime.containerd.version }}"
+  containerd_minor_version: "{{ spec.containerRuntime.containerd.version[:3] }}"
+kubectl_dry_run_flag: "{{ '--dry-run' if kubernetes_regexed_version < '1.18' else '--dry-run=client' }}"
+
+#===============================================================================
+# systemd-journald settings
+journald:
+  persistent_storage: True
+  log_rotation_size: "1G"
+  log_retention_time: "1year"
+
+#===============================================================================
+# OS metadata
+# Set to user provided value, otherwise default back to ansible_distribution
+configured_ansible_distribution: "{{ node_os_distribution[node_pool] if node_pool is defined and node_os_distribution[node_pool] is defined and node_os_distribution[node_pool] != '' else ansible_distribution }}"
+
+#===============================================================================
+# kubernetes packages - when adding new urls, please add them to pre-flight checks
+kubernetes_rpm_repository_url: "https://packages.d2iq.com/konvoy/rpm/stable/centos/7/x86_64"
+kubernetes_rpm_gpg_key_url: "https://packages.d2iq.com/konvoy/rpm-gpg-pub-key"
+kubernetes_deb_repository_url: "https://packages.cloud.google.com/apt/"
+kubernetes_deb_gpg_key_url: "https://packages.cloud.google.com/apt/doc/apt-key.gpg"
+# kubernetes-bionic does not exist yet
+kubernetes_deb_release_name: "kubernetes-xenial"
+
+# containerd package - when adding new urls, please add them to pre-flight checks
+# Appstream is enabled by default in rhel8, so install the package from local repositories in that case
+docker_rpm_container_selinux_package_url: "{{ 'http://mirror.centos.org/centos/7/extras/x86_64/Packages/container-selinux-2.107-3.el7.noarch.rpm' if ansible_distribution_major_version|int < 8 else 'container-selinux' }}"
+docker_rpm_container_selinux_gpg_key_url: "http://mirror.centos.org/centos/RPM-GPG-KEY-CentOS-7"
+
+docker_rpm_repository_url_upstream_mirror: "https://packages.d2iq.com/download.docker.com/linux/centos/7/x86_64/stable"
+docker_rpm_repository_url: "https://packages.d2iq.com/konvoy/stable/linux/centos/{{ ansible_distribution_major_version|int }}/x86_64"
+docker_rpm_gpg_key_url: "{{ docker_rpm_repository_url }}/gpg.asc"
+
+# Containerd 1.2 Deb package should be installed from the upstream mirror
+# Otherwise install the packages built by D2iQ
+containerd_use_dockerio_mirror_repo: "{{ package_versions.containerd_minor_version == '1.2' }}"
+docker_deb_repository_url_upstream_mirror: "https://packages.d2iq.com/download.docker.com/linux/{{ configured_ansible_distribution |lower }}"
+docker_deb_repository_url_d2iq_built: "https://packages.d2iq.com/konvoy/stable/linux/{{ configured_ansible_distribution |lower }}/{{ ansible_distribution_release }}"
+docker_deb_repository_url: "{{ docker_deb_repository_url_upstream_mirror if containerd_use_dockerio_mirror_repo else docker_deb_repository_url_d2iq_built }}"
+docker_deb_gpg_key_url_upstream_mirror: "https://download.docker.com/linux/{{ configured_ansible_distribution |lower }}/gpg"
+docker_deb_gpg_key_url_upstream_d2iq_built: "{{ docker_deb_repository_url_d2iq_built }}/gpg.asc"
+docker_deb_gpg_key_url: "{{ docker_deb_gpg_key_url_upstream_mirror if containerd_use_dockerio_mirror_repo else docker_deb_gpg_key_url_upstream_d2iq_built }}"
+docker_deb_release_name: "{{ ansible_distribution_release }}"
+docker_deb_component: "{{ 'stable' if containerd_use_dockerio_mirror_repo else 'main' }}"
+
+# nvidia package - when adding new urls, please add them to pre-flight checks
+libnvidia_container_rpm_repository_package_url: "https://nvidia.github.io/libnvidia-container/centos7/x86_64"
+libnvidia_container_deb_repository_url: "https://nvidia.github.io/libnvidia-container/ubuntu16.04/amd64"
+libnvidia_container_gpg_key_url: "https://nvidia.github.io/libnvidia-container/gpgkey"
+nvidia_container_runtime_rpm_repository_package_url: "https://nvidia.github.io/nvidia-container-runtime/centos7/x86_64"
+nvidia_container_runtime_deb_package_url: "https://nvidia.github.io/nvidia-container-runtime/ubuntu16.04/amd64"
+nvidia_container_runtime_gpg_key_url: "https://nvidia.github.io/nvidia-container-runtime/gpgkey"
+
+# etcd tunning properties
+etcd:
+  heartbeat_interval: 250
+  election_timeout: 5000
+  quota_backend_bytes: 4294967296
+
+control_plane_hostnames: "{{ groups['control-plane'] | map('extract', hostvars, ['ansible_hostname']) | select('defined') | list }}"
+worker_hostnames: "{{ groups['node'] | map('extract', hostvars, ['ansible_hostname']) | select('defined') | list }}"
+
+#===============================================================================
+# control-plane
+apiserver_endpoint: "{{ (spec.kubernetes.controlPlane.controlPlaneEndpointOverride if spec.kubernetes.controlPlane is defined else '') | default(control_plane_endpoint, true) }}"
+external_apiserver_address: "{{ apiserver_endpoint.split(':')[0] }}"
+external_apiserver_port: "{{ apiserver_endpoint.split(':')[1] }}"
+# we may be passed in 'none' replace that with an empty string
+cloud_provider: "{{ '' if spec.kubernetes.cloudProvider.provider == 'none' else spec.kubernetes.cloudProvider.provider }}"
+
+# keepalived config
+keepalived:
+  enabled: "{{ spec.kubernetes.controlPlane is defined and spec.kubernetes.controlPlane.keepalived is defined | bool }}"
+  virtual_ip: "{{ external_apiserver_address }}"
+  virtual_mask: 32
+  vrid: "{{ (spec.kubernetes.controlPlane.keepalived.vrid if spec.kubernetes.controlPlane is defined and spec.kubernetes.controlPlane.keepalived is defined else '') | default(keepalived_vrid, true) }}"
+  interface: "{{ (spec.kubernetes.controlPlane.keepalived.interface if spec.kubernetes.controlPlane is defined and spec.kubernetes.controlPlane.keepalived is defined else '') | default('') }}"
+  image: "mesosphere/keepalived-snmp:v0.2"
+  snmp_exporter_image: "quay.io/prometheus/snmp-exporter:v0.15.0"
+
+#===============================================================================
+# calico
+calico_encapsulation: "{{ spec.containerNetworking.calico.encapsulation }}"
+
+#===============================================================================
+# system environment settings
+# When changing a proxy environment setting, ensure that the change is reflected in `docs/site/install/http-proxy/index.md`.
+
+# the metadata IP is reachable from the nodes without needing to use the proxy
+aws_metadata_api: "{{ '169.254.169.254' if cloud_provider is defined and cloud_provider == 'aws' else '' }}"
+azure_metadata_api: "{{ '169.254.169.254' if cloud_provider is defined and cloud_provider == 'azure' else '' }}"
+azure_management_api: "{{ 'management.azure.com' if cloud_provider is defined and cloud_provider == 'azure' else '' }}"
+gcp_metadata_api: "{{ 'metadata,metadata.google.internal,metadata.google.internal.' if cloud_provider is defined and cloud_provider == 'gcp' else '' }}"
+gcp_metadata_api_ip: "{{ '169.254.169.254' if cloud_provider is defined and cloud_provider == 'gcp' else '' }}"
+gcp_apis: "{{ 'googleapis,.googleapis.com,googleapis.com.' if cloud_provider is defined and cloud_provider == 'gcp' else '' }}"
+internal_service_names: ["kubernetes", "kubernetes.default", "kubernetes.default.svc", "kubernetes.default.svc.cluster", "kubernetes.default.svc.cluster.local", ".svc", ".svc.cluster", ".svc.cluster.local"]
+no_proxy_string: "{{ ((groups.all | sort) + [spec.kubernetes.networking.podSubnet] + [spec.kubernetes.networking.serviceSubnet] + [external_apiserver_address] + ['localhost', '127.0.0.1'] + [aws_metadata_api] + [azure_metadata_api] + [azure_management_api] + [gcp_metadata_api] + [gcp_metadata_api_ip] +  [gcp_apis] + (internal_service_names) + (spec.kubernetes.networking.noProxy | default([]))) | join(',') }}"
+
+proxy_env:
+  HTTPS_PROXY: "{{ spec.kubernetes.networking.httpsProxy|default('') }}"
+  https_proxy: "{{ spec.kubernetes.networking.httpsProxy|default('') }}"
+  HTTP_PROXY: "{{ spec.kubernetes.networking.httpProxy|default('') }}"
+  http_proxy: "{{ spec.kubernetes.networking.httpProxy|default('') }}"
+  NO_PROXY: "{{ no_proxy_string }}"
+  no_proxy: "{{ no_proxy_string }}"
+
+system_default_path_env: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+system_path_env: "{{ ansible_env.PATH if ansible_env is defined and ansible_env.PATH is defined else '' }}:{{ system_default_path_env }}"
+
+combined_env: "{{ proxy_env | combine({'PATH': system_path_env}) }}"
+
+#===============================================================================
+
+# kube-apiserver additional arguments:
+apiserver:
+  secure_port: "{{ 6443 if cloud_provider is defined and cloud_provider == 'gcp' else external_apiserver_port }}"
+  target_ram_mb: 2048 # Ideally set to 4096 for a production environment
+  max_requests_inflight: 1200
+  max_mutating_requests_inflight: 400
+
+# kube-apiserver audit
+# path to audit log file
+audit_log_path: "/var/log/audit/kube-apiserver-audit.log"
+# num days
+audit_log_maxage: 30
+# the num of audit logs to retain
+audit_log_maxbackups: 10
+# the max size in MB to retain
+audit_log_maxsize: 100
+# policy file
+audit_policy_file: "/etc/kubernetes/audit-policy/apiserver-audit-policy.yaml"
+# audit log hostpath
+audit_log_name: "audit-logs"
+audit_log_hostpath: "/var/log/kubernetes/audit"
+audit_log_mountpath: "{{ audit_log_path | dirname }}"
+# audit policy hostpath
+audit_policy_name: "audit-policy"
+audit_policy_hostpath: "{{ audit_policy_file | dirname }}"
+audit_policy_mountpath: "{{ audit_policy_hostpath }}"
+
+# kube-scheduler additional arguments:
+scheduler:
+  kube_api_burst: 120
+  kube_api_qps: 80
+
+# kubelet additional arguments:
+kubelet:
+  event_qps: 0
+  event_burst: 30
+  kube_api_burst: 30
+  kube_api_qps: 15
+  max_pods: 110
+  pods_per_core: 0
+  fail_swap_on: "{{ not (spec.kubernetes.preflightChecks is defined and spec.kubernetes.preflightChecks.errorsToIgnore is defined and (('all' in spec.kubernetes.preflightChecks.errorsToIgnore) or ('swap' in spec.kubernetes.preflightChecks.errorsToIgnore))) }}"
+  cgroup_root: "{{ spec.kubernetes.kubelet.cgroupRoot if spec.kubernetes.kubelet is defined and spec.kubernetes.kubelet.cgroupRoot is defined else '' }}"
+  # Left the defaults empty for backwards compatibility 'kube-reserved=cpu=2,memory=2Gi,ephemeral-storage=1Gi'.
+  kube_reserved: "{{ spec.kubernetes.kubelet.kubeReserved if spec.kubernetes.kubelet is defined and spec.kubernetes.kubelet.kubeReserved is defined else '' }}"
+
+# kubeadm additional arguments:
+kubeadm:
+  ignore_preflight_errors: "{{ (spec.kubernetes.preflightChecks.errorsToIgnore if spec.kubernetes.preflightChecks is defined else []) | default([]) | join(',') }}"
+  # default_image_registry+'k8s.gcr.io' is only needed when the control-plane images are coming from 'k8s.gcr.io'
+  # k8s.gcr.io/kube-apiserver is at the top level and cannot be pulled because of https://github.com/containerd/containerd/issues/3756 when using the mirror option
+  # lets assume default_image_registry=https://myregistry:443/
+  # the Go code when retagging any images from k8s.gcr.io will tag with https://myregistry:443/k8s.gcr.io/kube-apiserver
+  # but when user specifies a spec.kubernetes.imageRepository, the image would be tagged as https://myregistry:443/mesosphere/kube-apiserver and will be pulled with the regular mirror mechanism
+  imageRepository: "{{ spec.kubernetes.imageRepository if spec.kubernetes.imageRepository is defined and spec.kubernetes.imageRepository != '' else default_image_registry+'k8s.gcr.io' }}"
+  pauseImage: "{{ spec.kubernetes.imageRepository+'/pause:3.1' if spec.kubernetes.imageRepository is defined and spec.kubernetes.imageRepository != '' else default_image_registry+'k8s.gcr.io/pause:3.1' }}"
+  # format the version to the Docker tag, same as kubeadm, replacing + with _
+  formatted_version: "{{ spec.kubernetes.version | replace('+', '_') }}"

@@ -1,0 +1,10 @@
+---
+  - hosts: node control-plane
+    any_errors_fatal: true
+    name: "{{ play_name | default('Check Control Plane Health') }}"
+    serial: "100%"
+    become: yes
+    environment: "{{ combined_env }}"
+
+    roles:
+      - role: check-kubernetes
