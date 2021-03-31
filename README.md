@@ -1,5 +1,8 @@
 # konvoy-k8s-check
 
+## Ansible command
+
+ansible-playbook check-kubernetes.yaml -i /root/konvoy-deploy/konvoy_v1.6.0/inventory.yaml --extra-vars '{"image_registries_with_auth":[],"default_image_registry":"","default_image_registry_mirrors":{},"provisioner":"","minimum_inclusive_kubernetes_version":"1.16.0","maximum_exclusive_kubernetes_version":"1.19.0"}' --extra-vars @/root/konvoy-deploy/konvoy_v1.6.0/cluster.yaml
 
 
 ## kube-scheduler check (running or error)
@@ -22,3 +25,4 @@ kubectl --kubeconfig /etc/kubernetes/admin.conf get deploy coredns -n kube-syste
 
 ## 노드 정보
 kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes -o wide
+
